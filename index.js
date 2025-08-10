@@ -142,6 +142,17 @@ if (fs.existsSync(CONFIG.TASKS_FILE)) {
   }
 }
 
+// Process missed tasks immediately on startup
+function processMissedTasks() {
+  const now = Date.now();
+  tasks.forEach((task, index) => {
+    if (task.repetitions > 0 && task.nextTime <= now) {
+      log.info(`Processing missed task for ${task.original.id}, nextTime: ${new Date(task.nextTime).toISOString()}`);
+      scheduleTask(index);
+    }
+  });
+}
+
 function saveTasks() {
   try {
     const serializableTasks = tasks.map(task => ({
@@ -158,17 +169,17 @@ function saveTasks() {
   }
 }
 
-// Publish a quote repost (kind 1 with varied message and requester credit)
+// Publish a quote repost (kind 6 with full event and requester credit)
 async function publishQuoteRepost(original, requesterPubkey) {
   const message = requesterPubkey
     ? CONFIG.REPOST_MESSAGES[Math.floor(Math.random() * CONFIG.REPOST_MESSAGES.length)].replace('{user}', `@${npubEncode(requesterPubkey)}`)
     : 'Banger alert! Reposting this gem.'; // Fallback for old tasks
   const repost = {
-    kind: 1,
-    content: message,
+    kind: 6, // Repost per NIP-18
+    content: `${message}\n\n${JSON.stringify(original)}`, // Include full original event
     tags: [
-      ['e', original.id, '', 'mention'], // Quote marker per NIP-18
-      ['p', original.pubkey],
+      ['e', original.id, '', 'mention'], // Reference original event
+      ['p', original.pubkey], // Tag original author
       ...(requesterPubkey ? [['p', requesterPubkey]] : []), // Tag requester
     ],
     created_at: Math.floor(Date.now() / 1000),
@@ -204,6 +215,7 @@ function scheduleTask(taskIndex) {
   }
 
   if (delay <= 0) {
+    log.info(`Executing missed or due task for ${task.original.id}`);
     publishQuoteRepost(task.original, task.requesterPubkey);
     task.repetitions -= 1;
     if (task.repetitions > 0) {
@@ -222,6 +234,7 @@ function scheduleTask(taskIndex) {
   }
 
   task.timer = setTimeout(() => {
+    log.info(`Executing scheduled task for ${task.original.id}`);
     publishQuoteRepost(task.original, task.requesterPubkey);
     task.repetitions -= 1;
     if (task.repetitions > 0) {
@@ -235,8 +248,15 @@ function scheduleTask(taskIndex) {
   }, delay);
 }
 
+// Process missed tasks after loading
+processMissedTasks();
+
 // Schedule all loaded tasks
-tasks.forEach((_, index) => scheduleTask(index));
+tasks.forEach((_, index) => {
+  if (tasks[index].repetitions > 0 && tasks[index].nextTime > Date.now()) {
+    scheduleTask(index);
+  }
+});
 
 // Subscribe to mentions
 let sub;
