@@ -1,7 +1,7 @@
 require('dotenv').config(); // Load env vars from .env file
 
 const fs = require('fs');
-const { finalizeEvent, getPublicKey } = require('nostr-tools/pure');
+const { finalizeEvent, getPublicKey, encodeEvent } = require('nostr-tools/pure');
 const { SimplePool } = require('nostr-tools/pool');
 const { useWebSocketImplementation } = require('nostr-tools/pool');
 const { decode, npubEncode } = require('nostr-tools/nip19');
@@ -169,18 +169,24 @@ function saveTasks() {
   }
 }
 
-// Publish a quote repost (kind 6 with full event and requester credit)
+// Publish a quote repost (kind 1 with NIP-21 nevent and relay hints)
 async function publishQuoteRepost(original, requesterPubkey) {
   const message = requesterPubkey
-    ? CONFIG.REPOST_MESSAGES[Math.floor(Math.random() * CONFIG.REPOST_MESSAGES.length)].replace('{user}', `@${npubEncode(requesterPubkey)}`)
+    ? CONFIG.REPOST_MESSAGES[Math.floor(Math.random() * CONFIG.REPOST_MESSAGES.length)].replace('{user}', `nostr:${npubEncode(requesterPubkey)}`)
     : 'Banger alert! Reposting this gem.'; // Fallback for old tasks
+
+  // Generate NIP-21 nevent ID with relay hints
+  const nevent = encodeEvent(original, CONFIG.RELAYS);
+
+  // Create kind 1 event with relay tags
   const repost = {
-    kind: 6, // Repost per NIP-18
-    content: `${message}\n\n${JSON.stringify(original)}`, // Include full original event
+    kind: 1,
+    content: `${message}\n\n${nevent}`,
     tags: [
-      ['e', original.id, '', 'mention'], // Reference original event
-      ['p', original.pubkey], // Tag original author
-      ...(requesterPubkey ? [['p', requesterPubkey]] : []), // Tag requester
+      ['e', original.id, CONFIG.RELAYS[0], 'mention'], // Primary relay for event
+      ['p', original.pubkey, CONFIG.RELAYS[0], 'mention'], // Primary relay for pubkey
+      ...(requesterPubkey ? [['p', requesterPubkey, CONFIG.RELAYS[0], 'mention']] : []),
+      ...CONFIG.RELAYS.map(relay => ['r', relay]), // All relays as recommendations
     ],
     created_at: Math.floor(Date.now() / 1000),
   };
