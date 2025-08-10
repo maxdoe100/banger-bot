@@ -21,10 +21,15 @@ const CONFIG = {
     'wss://relay.damus.io',
     'wss://nos.lol',
     'wss://relay.nostr.band',
-    'wss://relay.primal.net/',
+    'wss://relay.nostrfeed.com',
+    'wss://nostr.wine',
+    'wss://nostr.sethforprivacy.com',
+    'wss://nostr.thank.eu',
+    'wss://nostr21.com',
   ],
   MAX_REPETITIONS: 3,
   MAX_TASKS: 10000, // Prevent runaway growth
+  MAX_SAFE_DELAY: 30 * 24 * 60 * 60 * 1000, // 30 days, below 2^31 ms
   TASKS_FILE: process.env.DATA_PATH || './tasks.json', // Render: /data/tasks.json
   CONFIRM_MESSAGES: [
     "You are right, that's a banger! Scheduling now.",
@@ -56,13 +61,8 @@ const CONFIG = {
     months: 30 * 24 * 60 * 60 * 1000,
     year: 365 * 24 * 60 * 60 * 1000,
     years: 365 * 24 * 60 * 60 * 1000,
-  },
-  JITTER_MS_BY_INTERVAL: {
-    hourly: 10 * 60 * 1000, // ±10 minutes
-    daily: 4 * 60 * 60 * 1000, // ±4 hours
-    weekly: 12 * 60 * 60 * 1000, // ±12 hours
-    monthly: 3 * 24 * 60 * 60 * 1000, // ±3 days
-    yearly: 7 * 24 * 60 * 60 * 1000, // ±7 days
+    time: 1, // Placeholder for "times"
+    times: 1, // Placeholder for "times"
   },
 };
 
@@ -81,52 +81,51 @@ try {
 }
 const pubkey = getPublicKey(privateKey);
 log.info(`Bot pubkey (hex): ${pubkey}`);
-try {
-  log.info(`Bot npub: ${npubEncode(pubkey)}`);
-} catch (_) {
-  // ignore npub log failure
-}
 
 const pool = new SimplePool();
 pool.onNotice = (notice, relay) => log.info(`Notice from ${relay}: ${notice}`);
 
-// Parse command from mention text - flexible with mismatched units
+// Parse command from mention text - flexible with mismatched units and order variations
 function parseCommand(content) {
   // Normalize: lowercase, collapse spaces
   const normalized = content.toLowerCase().replace(/\s+/g, ' ').trim();
   
-  // Single regex: optional "banger," "repeat," "for"; any unit
+  // Single regex with alternation for order: interval first or count first
   const match = normalized.match(
-    /(?:banger|(?:that'?s|this is|it'?s)?\s*(?:a|an)?\s*banger\s*)?(?:repeat\s*)?(hourly|daily|weekly|monthly|yearly)(?:\s*for)?\s*(\d+)\s*(hours?|days?|weeks?|months?|years?)/i
+    /(?:banger|(?:that'?s|this is|it'?s)?\s*(?:a|an)?\s*banger\s*)?(?:repeat\s*)?((hourly|daily|weekly|monthly|yearly)(?:\s*for)?\s*(\d+)\s*(hours?|days?|weeks?|months?|years?|times?)?|(\d+)\s*(hours?|days?|weeks?|months?|years?|times?)\s*(hourly|daily|weekly|monthly|yearly))/i
   );
   if (!match) return null;
 
-  const [, interval, countStr, unit] = match;
+  let interval, countStr, unit;
+  if (match[2]) {
+    // Interval first
+    interval = match[2];
+    countStr = match[3];
+    unit = match[4] || 'times'; // Default to 'times' if no unit
+  } else {
+    // Count first
+    countStr = match[4];
+    unit = match[5] || 'times'; // Default to 'times' if no unit
+    interval = match[6];
+  }
+
   const count = parseInt(countStr);
   if (isNaN(count) || count < 1) return null;
 
-  // Calculate repetitions based on duration (count * unit) and interval
-  const durationMs = count * CONFIG.UNIT_TO_MS[unit];
-  if (!durationMs) return null; // Unknown unit
-
+  // Calculate repetitions
   let repetitions;
-  if (interval === 'hourly') {
-    repetitions = Math.ceil(durationMs / CONFIG.INTERVALS.hourly); // e.g., 3 days = 72 hours
-  } else if (interval === 'daily') {
-    repetitions = Math.ceil(durationMs / CONFIG.INTERVALS.daily); // e.g., 2 weeks = 14 days
-  } else if (interval === 'weekly') {
-    repetitions = Math.ceil(durationMs / CONFIG.INTERVALS.weekly); // e.g., 3 months = 12 weeks
-  } else if (interval === 'monthly') {
-    repetitions = Math.ceil(durationMs / CONFIG.INTERVALS.monthly); // e.g., 2 years = 24 months
-  } else if (interval === 'yearly') {
-    repetitions = Math.ceil(durationMs / CONFIG.INTERVALS.yearly); // e.g., 2 years = 2 years
+  if (unit === 'time' || unit === 'times') {
+    repetitions = count; // Literal repetitions
   } else {
-    return null;
+    const durationMs = count * CONFIG.UNIT_TO_MS[unit];
+    if (!durationMs) return null; // Unknown unit
+
+    repetitions = Math.ceil(durationMs / CONFIG.INTERVALS[interval]);
+    if (repetitions < 1) return null; // Too short
   }
 
   // Cap repetitions
   repetitions = Math.min(repetitions, CONFIG.MAX_REPETITIONS);
-  if (repetitions < 1) return null; // e.g., "monthly for 1 hour" too short
 
   return { interval, repetitions, duration: { count, unit } };
 }
@@ -147,7 +146,7 @@ function saveTasks() {
   try {
     const serializableTasks = tasks.map(task => ({
       original: task.original,
-      interval: task.interval, // For jitter lookup
+      interval: task.interval,
       intervalMs: task.intervalMs,
       repetitions: task.repetitions,
       nextTime: task.nextTime,
@@ -183,7 +182,7 @@ async function publishQuoteRepost(original, requesterPubkey) {
   }
 }
 
-// Schedule a task (chained setTimeout)
+// Schedule a task (chained setTimeout with safe delay handling)
 function scheduleTask(taskIndex) {
   const task = tasks[taskIndex];
   if (!task || task.repetitions <= 0) {
@@ -195,15 +194,26 @@ function scheduleTask(taskIndex) {
   }
 
   const now = Date.now();
-  const jitterMs = CONFIG.JITTER_MS_BY_INTERVAL[task.interval] || CONFIG.JITTER_MS_BY_INTERVAL.weekly; // Fallback
   let delay = task.nextTime - now;
+
+  // Handle large delays
+  if (delay > CONFIG.MAX_SAFE_DELAY) {
+    // Schedule intermediate timeout
+    task.timer = setTimeout(() => scheduleTask(taskIndex), CONFIG.MAX_SAFE_DELAY);
+    return;
+  }
+
   if (delay <= 0) {
     publishQuoteRepost(task.original, task.requesterPubkey);
     task.repetitions -= 1;
     if (task.repetitions > 0) {
-      task.nextTime = now + task.intervalMs + (Math.random() * 2 * jitterMs - jitterMs);
+      task.nextTime = now + task.intervalMs;
       saveTasks();
       delay = task.nextTime - now;
+      if (delay > CONFIG.MAX_SAFE_DELAY) {
+        task.timer = setTimeout(() => scheduleTask(taskIndex), CONFIG.MAX_SAFE_DELAY);
+        return;
+      }
     } else {
       tasks.splice(taskIndex, 1);
       saveTasks();
@@ -215,7 +225,7 @@ function scheduleTask(taskIndex) {
     publishQuoteRepost(task.original, task.requesterPubkey);
     task.repetitions -= 1;
     if (task.repetitions > 0) {
-      task.nextTime += task.intervalMs + (Math.random() * 2 * jitterMs - jitterMs);
+      task.nextTime += task.intervalMs;
       saveTasks();
       scheduleTask(taskIndex);
     } else {
@@ -292,12 +302,12 @@ try {
         }
         if (!original || original.pubkey === pubkey) return;
 
-        // Prevent duplicates
-        if (tasks.some(t => t.original.id === original.id)) {
-          log.info(`Duplicate task for ${original.id}, skipping`);
+        // Check for active task
+        if (tasks.some(t => t.original.id === original.id && t.repetitions > 0)) {
+          log.info(`Active task exists for ${original.id}, rejecting new schedule`);
           const error = {
             kind: 1,
-            content: "This post is already scheduled! Pick another banger.",
+            content: "There's already a task running for this post. Wait until it completes!",
             tags: [['e', event.id, '', 'reply'], ['p', event.pubkey]],
             created_at: Math.floor(Date.now() / 1000),
           };
@@ -305,19 +315,18 @@ try {
           try {
             await Promise.any(pool.publish(CONFIG.RELAYS, signedError));
           } catch (err) {
-            log.error('Publish duplicate reply error', err);
+            log.error('Publish active task reply error', err);
           }
           return;
         }
 
         // Add task
-        const jitterMs = CONFIG.JITTER_MS_BY_INTERVAL[interval] || CONFIG.JITTER_MS_BY_INTERVAL.weekly; // Fallback
         const task = {
           original,
-          interval, // Store for jitter lookup
+          interval,
           intervalMs,
           repetitions,
-          nextTime: Date.now() + intervalMs + (Math.random() * 2 * jitterMs - jitterMs),
+          nextTime: Date.now() + intervalMs,
           requesterPubkey: event.pubkey,
           timer: null,
         };
