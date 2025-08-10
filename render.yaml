@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: nostr-banger-bot
+    env: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: PRIVATE_KEY
+        sync: false
+      - key: DATA_PATH
+        value: /data/tasks.json
+    disks:
+      - name: data
+        mountPath: /data
+        sizeGB: 1
+
+
