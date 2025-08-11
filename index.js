@@ -1,10 +1,10 @@
 require('dotenv').config(); // Load env vars from .env file
 
 const fs = require('fs');
-const { finalizeEvent, getPublicKey, encodeEvent } = require('nostr-tools/pure');
+const { finalizeEvent, getPublicKey } = require('nostr-tools/pure');
 const { SimplePool } = require('nostr-tools/pool');
 const { useWebSocketImplementation } = require('nostr-tools/pool');
-const { decode, npubEncode } = require('nostr-tools/nip19');
+const { decode, npubEncode, neventEncode } = require('nostr-tools/nip19');
 const WebSocket = require('ws');
 
 // Logging utility
@@ -176,12 +176,15 @@ async function publishQuoteRepost(original, requesterPubkey) {
     : 'Banger alert! Reposting this gem.'; // Fallback for old tasks
 
   // Generate NIP-21 nevent ID with relay hints
-  const nevent = encodeEvent(original, CONFIG.RELAYS);
+  const nevent = neventEncode({
+    id: original.id,
+    relays: CONFIG.RELAYS,
+  });
 
   // Create kind 1 event with relay tags
   const repost = {
     kind: 1,
-    content: `${message}\n\n${nevent}`,
+    content: `${message}\n\nnostr:${nevent}`,
     tags: [
       ['e', original.id, CONFIG.RELAYS[0], 'mention'], // Primary relay for event
       ['p', original.pubkey, CONFIG.RELAYS[0], 'mention'], // Primary relay for pubkey
@@ -334,7 +337,7 @@ try {
           const error = {
             kind: 1,
             content: "There's already a task running for this post. Wait until it completes!",
-            tags: [['e', event.id, '', 'reply'], ['p', event.pubkey]],
+          tags: [['e', event.id, '', 'reply'], ['p', event.pubkey]],
             created_at: Math.floor(Date.now() / 1000),
           };
           const signedError = finalizeEvent(error, privateKey);
